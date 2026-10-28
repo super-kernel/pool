@@ -1,0 +1,31 @@
+{
+    "name": "super-kernel/pool",
+    "description": "Connection pools with coroutine, process and thread coordination and caller-owned resource lifecycle.",
+    "type": "library",
+    "license": "MIT",
+    "require": {
+        "php": ">=8.4.27 <8.5",
+        "ext-swoole": ">=6.2.3 <6.3"
+    },
+    "require-dev": {
+        "friendsofphp/php-cs-fixer": "^3.95.27",
+        "phpunit/phpunit": "^13.4.3"
+    },
+    "autoload": {
+        "psr-4": {
+            "SuperKernel\\Pool\\": "src/"
+        }
+    },
+    "autoload-dev": {
+        "psr-4": {
+            "SuperKernel\\Pool\\Tests\\": "tests/"
+        }
+    },
+    "minimum-stability": "dev",
+    "prefer-stable": true,
+    "scripts": {
+        "format": "@php vendor/bin/php-cs-fixer fix --show-progress=bar --no-ansi",
+        "format:check": "@php vendor/bin/php-cs-fixer check --show-progress=bar --no-ansi --diff",
+        "test": "@php vendor/bin/phpunit"
+    }
+}
