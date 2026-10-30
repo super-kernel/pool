@@ -10,7 +10,6 @@ use SuperKernel\Pool\Contract\CapacityInterface;
 use SuperKernel\Pool\Contract\ChannelInterface;
 use SuperKernel\Pool\Exception\PoolException;
 use SuperKernel\Pool\Runtime\ExecutionContext;
-use Swoole\Coroutine;
 
 use function count;
 use function is_finite;
@@ -51,7 +50,7 @@ final class CoroutineCapacity implements CapacityInterface
 
     public function reserve(float $timeout, string $owner): string
     {
-        $this->assertContext();
+        CoroutineContextGuard::assert($this->context);
         if (!is_finite($timeout) || 0 > $timeout || '' === $owner || 64 < strlen($owner)) {
             throw new InvalidArgumentException('A finite non-negative timeout and a 1-64 byte owner are required.');
         }
@@ -59,7 +58,7 @@ final class CoroutineCapacity implements CapacityInterface
             throw new PoolException('A coroutine backend belongs to one resource-owning pool.');
         }
         $this->owner = $owner;
-        if (!$this->initialized && !$this->isClosed()) {
+        if (!$this->initialized && !$this->channel->isClosed()) {
             for ($index = 0; $index < $this->limit; ++$index) {
                 $this->channel->push(true);
             }
@@ -80,19 +79,19 @@ final class CoroutineCapacity implements CapacityInterface
 
     public function release(string $reservation, string $owner): void
     {
-        $this->assertContext();
+        CoroutineContextGuard::assert($this->context);
         if (($this->reservations[$reservation] ?? null) !== $owner) {
             throw new PoolException('Only the reserving owner can release a capacity reservation.');
         }
         unset($this->reservations[$reservation]);
-        if (!$this->isClosed()) {
+        if (!$this->channel->isClosed()) {
             $this->channel->push(true);
         }
     }
 
     public function available(): int
     {
-        return $this->isClosed() ? 0 : $this->limit - count($this->reservations);
+        return $this->channel->isClosed() ? 0 : $this->limit - count($this->reservations);
     }
 
     public function allowsIdleConnections(): bool
@@ -102,12 +101,7 @@ final class CoroutineCapacity implements CapacityInterface
 
     public function assertContext(): void
     {
-        if ($this->context !== $this->contextId()) {
-            throw new PoolException('A coroutine backend cannot be shared between processes or threads.');
-        }
-        if (0 > Coroutine::getCid()) {
-            throw new PoolException('Connection pool operations require an active Swoole coroutine.');
-        }
+        CoroutineContextGuard::assert($this->context);
     }
 
     public function contextId(): string
@@ -117,8 +111,8 @@ final class CoroutineCapacity implements CapacityInterface
 
     public function close(): void
     {
-        if ($this->initialized && !$this->isClosed()) {
-            $this->assertContext();
+        if ($this->initialized && !$this->channel->isClosed()) {
+            CoroutineContextGuard::assert($this->context);
         }
         $this->channel->close();
     }

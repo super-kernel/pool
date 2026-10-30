@@ -6,10 +6,8 @@ namespace SuperKernel\Pool\Frequency;
 
 use Closure;
 use InvalidArgumentException;
-use LogicException;
 use SuperKernel\Pool\Contract\FrequencyInterface;
 use Throwable;
-use UnexpectedValueException;
 
 use function exp;
 use function hrtime;
@@ -21,12 +19,7 @@ use const PHP_FLOAT_MAX;
 /** Estimates demand with exponential decay and one initial observation window before shrinking. */
 final class SmartLowFrequency implements FrequencyInterface
 {
-    /** @var Closure(): float */
-    private readonly Closure $clock;
-
-    private readonly float $startedAt;
-
-    private float $updatedAt;
+    private readonly ClockProgress $progress;
 
     private float $rate = 0.0;
 
@@ -48,51 +41,29 @@ final class SmartLowFrequency implements FrequencyInterface
                 'A finite positive frequency threshold and observation window are required.',
             );
         }
-        $this->clock = $clock ?? static fn(): float => hrtime(true) / 1_000_000_000;
-        $this->startedAt = $this->timestamp();
-        $this->updatedAt = $this->startedAt;
+        $this->progress = new ClockProgress(
+            new FrequencyClock($clock ?? static fn(): float => hrtime(true) / 1_000_000_000),
+        );
     }
 
     public function recordBorrow(): void
     {
-        $this->decay();
+        $this->rate *= exp(-($this->progress->advance() / $this->windowSeconds));
         $this->rate = min(PHP_FLOAT_MAX, $this->rate + 1.0 / $this->windowSeconds);
     }
 
     public function frequency(): float
     {
-        $this->decay();
+        $this->rate *= exp(-($this->progress->advance() / $this->windowSeconds));
 
         return $this->rate;
     }
 
     public function isLowFrequency(): bool
     {
-        $frequency = $this->frequency();
+        $this->rate *= exp(-($this->progress->advance() / $this->windowSeconds));
 
-        return $this->updatedAt - $this->startedAt >= $this->windowSeconds
-            && $frequency < $this->lowFrequencyThreshold;
-    }
-
-    /** @throws Throwable When the clock fails, moves backwards, or returns a non-finite timestamp */
-    private function decay(): void
-    {
-        $now = $this->timestamp();
-        if ($now < $this->updatedAt) {
-            throw new LogicException('The frequency clock must not move backwards.');
-        }
-        $this->rate *= exp(-(($now - $this->updatedAt) / $this->windowSeconds));
-        $this->updatedAt = $now;
-    }
-
-    /** @throws Throwable When the clock fails or returns a non-finite timestamp */
-    private function timestamp(): float
-    {
-        $now = ($this->clock)();
-        if (!is_finite($now)) {
-            throw new UnexpectedValueException('The frequency clock must return finite monotonic seconds.');
-        }
-
-        return $now;
+        return $this->progress->observedSeconds() >= $this->windowSeconds
+            && $this->rate < $this->lowFrequencyThreshold;
     }
 }

@@ -5,26 +5,29 @@ declare(strict_types=1);
 namespace SuperKernel\Pool\Capacity;
 
 use InvalidArgumentException;
+use SuperKernel\Pool\Capacity\Reservation\SharedReservationCoordinator;
+use SuperKernel\Pool\Capacity\Reservation\ThreadReservationStore;
 use SuperKernel\Pool\Exception\PoolException;
 use Swoole\Thread\Lock;
 use Swoole\Thread\Map;
 
 use function class_exists;
-use function is_string;
 
 /** Pass state() and mutex() as Swoole Thread arguments, then attach them in each thread. */
 final class ThreadCapacity extends SharedCapacity
 {
-    private const string CAPACITY = '@capacity';
+    private readonly ThreadReservationStore $store;
 
-    private const string CLOSED = '@closed';
+    private readonly SharedReservationCoordinator $coordinator;
 
     /** @throws InvalidArgumentException When the shared state was not initialized by create() */
     public function __construct(private readonly Map $sharedState, private readonly Lock $sharedMutex)
     {
-        if (1 > ($sharedState[self::CAPACITY] ?? 0)) {
+        if (ThreadReservationStore::isUninitialized($sharedState)) {
             throw new InvalidArgumentException('Attach shared state initialized by ThreadCapacity::create().');
         }
+        $this->store = new ThreadReservationStore($sharedState, $sharedMutex);
+        $this->coordinator = new SharedReservationCoordinator($this->store);
     }
 
     /**
@@ -39,11 +42,8 @@ final class ThreadCapacity extends SharedCapacity
         if (!class_exists(Map::class) || !class_exists(Lock::class)) {
             throw new PoolException('The thread backend requires PHP ZTS and Swoole thread support.');
         }
-        $state = new Map();
-        $state[self::CAPACITY] = $capacity;
-        $state[self::CLOSED] = false;
 
-        return new self($state, new Lock());
+        return new self(ThreadReservationStore::initialState($capacity), new Lock());
     }
 
     public function state(): Map
@@ -58,52 +58,31 @@ final class ThreadCapacity extends SharedCapacity
 
     public function capacity(): int
     {
-        return $this->sharedState[self::CAPACITY];
+        return $this->store->capacity();
     }
 
     public function isClosed(): bool
     {
-        return $this->sharedState[self::CLOSED];
+        return $this->store->isClosed();
     }
 
-    /** @throws PoolException When shared reservation storage cannot be locked */
-    protected function lock(): void
+    public function reserve(float $timeout, string $owner): string
     {
-        if (!$this->sharedMutex->lock()) {
-            throw new PoolException('Unable to lock shared reservation storage.');
-        }
+        return $this->coordinator->reserve($timeout, $owner);
     }
 
-    protected function unlock(): void
+    public function release(string $reservation, string $owner): void
     {
-        $this->sharedMutex->unlock();
+        $this->coordinator->release($reservation, $owner);
     }
 
-    protected function read(string $reservation): ?string
+    public function available(): int
     {
-        // Metadata cannot be used as a capacity reservation.
-        $record = $this->sharedState[$reservation];
-
-        return is_string($record) ? $record : null;
+        return $this->coordinator->available();
     }
 
-    protected function write(string $reservation, string $owner): void
+    public function close(): void
     {
-        $this->sharedState->offsetSet($reservation, $owner);
-    }
-
-    protected function remove(string $reservation): void
-    {
-        $this->sharedState->offsetUnset($reservation);
-    }
-
-    protected function countReservations(): int
-    {
-        return $this->sharedState->count() - 2;
-    }
-
-    protected function markClosed(): void
-    {
-        $this->sharedState->offsetSet(self::CLOSED, true);
+        $this->coordinator->close();
     }
 }
