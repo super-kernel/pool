@@ -39,15 +39,27 @@ final class SwooleTimerScheduler implements MaintenanceSchedulerInterface
     /** @throws PoolException When maintenance is closed or the timer cannot be started */
     public function start(): void
     {
-        if ($this->isRunning()) {
+        if (null !== $this->timer && Timer::exists($this->timer)) {
             return;
         }
         if ($this->maintenance->isClosed()) {
             throw new PoolException('Cannot schedule maintenance on a closed pool.');
         }
-        $timer = Timer::tick($this->intervalMilliseconds, function (): void {
+        $runPass = function (): void {
+            try {
+                $this->maintenance->maintain($this->minimumIdle);
+            } catch (Throwable $exception) {
+                ($this->onError)($exception);
+            } finally {
+                $this->runningPass = false;
+            }
+        };
+        $timer = Timer::tick($this->intervalMilliseconds, function () use ($runPass): void {
             if ($this->maintenance->isClosed()) {
-                $this->stop();
+                if (null !== $this->timer) {
+                    Timer::clear($this->timer);
+                    $this->timer = null;
+                }
 
                 return;
             }
@@ -56,8 +68,8 @@ final class SwooleTimerScheduler implements MaintenanceSchedulerInterface
             }
             $this->runningPass = true;
             if (0 <= Coroutine::getCid()) {
-                $this->runPass();
-            } elseif (false === Coroutine::create($this->runPass(...))) {
+                $runPass();
+            } elseif (false === Coroutine::create($runPass)) {
                 $this->runningPass = false;
                 ($this->onError)(new PoolException('Cannot start the maintenance coroutine.'));
             }
@@ -79,16 +91,5 @@ final class SwooleTimerScheduler implements MaintenanceSchedulerInterface
     public function isRunning(): bool
     {
         return null !== $this->timer && Timer::exists($this->timer);
-    }
-
-    private function runPass(): void
-    {
-        try {
-            $this->maintenance->maintain($this->minimumIdle);
-        } catch (Throwable $exception) {
-            ($this->onError)($exception);
-        } finally {
-            $this->runningPass = false;
-        }
     }
 }

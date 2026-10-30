@@ -7,16 +7,16 @@ with thread support. Protocol adapters are not bundled.
 
 ## Contracts and ownership
 
-| API | Responsibility |
-| --- | --- |
-| `Contract\ConnectionInterface` | Establish, check, reconnect and close one caller-defined connection. |
-| `Contract\ConnectionFactoryInterface<T>` | Create a fresh connection wrapper. |
-| `Contract\ChannelInterface<T>` | A bounded FIFO queue with explicit timeout and shutdown behavior. |
-| `Config\PoolOption<T>` | Concrete options with fixed limits, connection factory, capacity coordinator and policies. |
-| `Contract\CapacityInterface` | Reserve and release capacity without transporting connections. |
-| `Contract\PoolInterface<T>` | Acquire, return, discard, maintain and shut down connections. |
-| `Contract\FrequencyInterface` | Select full replenishment or low-demand shrinking from borrow frequency. |
-| `Contract\MaintenanceSchedulerInterface` | Explicitly start and stop a maintenance trigger. |
+| API                                      | Responsibility                                                                             |
+|------------------------------------------|--------------------------------------------------------------------------------------------|
+| `Contract\ConnectionInterface`           | Establish, check, reconnect and close one caller-defined connection.                       |
+| `Contract\ConnectionFactoryInterface<T>` | Create a fresh connection wrapper.                                                         |
+| `Contract\ChannelInterface<T>`           | A bounded FIFO queue with explicit timeout and shutdown behavior.                          |
+| `Config\PoolOption<T>`                   | Concrete options with fixed limits, connection factory, capacity coordinator and policies. |
+| `Contract\CapacityInterface`             | Reserve and release capacity without transporting connections.                             |
+| `Contract\PoolInterface<T>`              | Acquire, return, discard, maintain and shut down connections.                              |
+| `Contract\FrequencyInterface`            | Select full replenishment or low-demand shrinking from borrow frequency.                   |
+| `Contract\MaintenanceSchedulerInterface` | Explicitly start and stop a maintenance trigger.                                           |
 
 `PoolOption` is a final readonly options class supplied by this package. Consumers construct this exact class
 to configure their pools. It is not a Config `Configuration` source. There are no Config, DI, Attribute, container, Framework or Server dependencies or default
@@ -33,11 +33,11 @@ A false health result retires the wrapper and allows replacement through the fac
 
 ## Capacity and backend selection
 
-| Backend | Shared scope | Idle connections | Assembly |
-| --- | --- | --- | --- |
-| `Capacity\CoroutineCapacity` | Coroutines in one process/thread | Retained and reused locally | One exclusive backend per pool; active operations require a coroutine. |
-| `Capacity\ProcessCapacity` | Related forked processes | Returned clients are closed by their owner | Create the backend before forking and each Pool/factory after forking. |
-| `Capacity\ThreadCapacity` | Native Swoole threads | Returned clients are closed by their owner | Create shared state once and attach it in each thread. |
+| Backend                      | Shared scope                     | Idle connections                           | Assembly                                                               |
+|------------------------------|----------------------------------|--------------------------------------------|------------------------------------------------------------------------|
+| `Capacity\CoroutineCapacity` | Coroutines in one process/thread | Retained and reused locally                | One exclusive backend per pool; active operations require a coroutine. |
+| `Capacity\ProcessCapacity`   | Related forked processes         | Returned clients are closed by their owner | Create the backend before forking and each Pool/factory after forking. |
+| `Capacity\ThreadCapacity`    | Native Swoole threads            | Returned clients are closed by their owner | Create shared state once and attach it in each thread.                 |
 
 The coroutine backend queues boolean capacity tokens using `Channel\SwooleChannel`; idle
 connections are stored separately. There is no `ConnectionSlot`. An alternative initially empty,
@@ -63,13 +63,13 @@ application-wide limit. Native connection transport and a centralized connection
 and `B` is the borrowed count, the pool's remaining capacity at rest is `P = M - B`. The number of ready
 idle connections `I` may be smaller than `P`; missing connections are replenished during maintenance.
 
-| Completed transition | Remaining capacity `P` | Ready idle connections `I` |
-| --- | --- | --- |
-| Borrow a healthy idle connection | -1 | -1 |
-| Return a reusable connection | +1 | +1 |
-| Return and successfully destroy an unusable connection | +1 | Unchanged |
-| Destroy an unhealthy idle connection | Unchanged | -1 |
-| Successfully replenish a connection | Unchanged | +1 |
+| Completed transition                                   | Remaining capacity `P` | Ready idle connections `I` |
+|--------------------------------------------------------|------------------------|----------------------------|
+| Borrow a healthy idle connection                       | -1                     | -1                         |
+| Return a reusable connection                           | +1                     | +1                         |
+| Return and successfully destroy an unusable connection | +1                     | Unchanged                  |
+| Destroy an unhealthy idle connection                   | Unchanged              | -1                         |
+| Successfully replenish a connection                    | Unchanged              | +1                         |
 
 Borrowed connections remain registered for counting and return validation, but maintenance never operates
 on them. Idle, borrowed, creating, checking and closing connections all count towards `M`, including
@@ -160,12 +160,12 @@ package does not infer process death, replay requests or steal live reservations
 
 `HealthCheckMode` controls synchronous health checks on retained connections:
 
-| Mode | Before idle reuse | Before retaining a returned connection |
-| --- | --- | --- |
-| `OnBorrow` | Yes | No |
-| `OnReturn` | No | Yes |
-| `OnBorrowAndReturn` (default) | Yes | Yes |
-| `Manual` | No | No |
+| Mode                          | Before idle reuse | Before retaining a returned connection |
+|-------------------------------|-------------------|----------------------------------------|
+| `OnBorrow`                    | Yes               | No                                     |
+| `OnReturn`                    | No                | Yes                                    |
+| `OnBorrowAndReturn` (default) | Yes               | Yes                                    |
+| `Manual`                      | No                | No                                     |
 
 A shared backend always closes returned clients and therefore does not run a health check to
 retain them. Before idle reuse, borrow checking retires unhealthy candidates and examines the remaining
