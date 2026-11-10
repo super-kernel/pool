@@ -4,156 +4,193 @@
 
 # SuperKernel Pool
 
-`super-kernel/pool` provides connection-pool foundations for caller-owned Redis, MySQL, HTTP, cURL, WebSocket and custom adapters. It requires `ext-swoole >=6.2.3 <6.3`; the thread backend additionally needs PHP ZTS and a Swoole build with thread support. Protocol adapters are not bundled.
+`super-kernel/pool` provides a connection pool for any client a caller wraps, such as Redis, MySQL, HTTP, or WebSocket, with a limit that holds within one process, across forked processes, or across Swoole threads.
 
-## Contracts and ownership
+## Installation
 
-| API                                      | Responsibility                                                                             |
-|------------------------------------------|--------------------------------------------------------------------------------------------|
-| `Contract\ConnectionInterface`           | Establish, check, reconnect and close one caller-defined connection.                       |
-| `Contract\ConnectionFactoryInterface<T>` | Create a fresh connection wrapper.                                                         |
-| `Contract\ChannelInterface<T>`           | A bounded FIFO queue with explicit timeout and shutdown behavior.                          |
-| `Config\PoolOption<T>`                   | Concrete options with fixed limits, connection factory, capacity coordinator and policies. |
-| `Contract\CapacityInterface`             | Reserve and release capacity without transporting connections.                             |
-| `Contract\PoolInterface<T>`              | Acquire, return, discard, maintain and shut down connections.                              |
-| `Contract\FrequencyInterface`            | Select full replenishment or low-demand shrinking from borrow frequency.                   |
-| `Contract\MaintenanceSchedulerInterface` | Explicitly start and stop a maintenance trigger.                                           |
+```bash
+composer require super-kernel/pool
+```
 
-`PoolOption` is a final readonly options class supplied by this package. Consumers construct this exact class to configure their pools. It is not a Config `Configuration` source. The package has no Config, DI, Attribute, container, Framework or Server dependencies or default service bindings. Connection settings, credentials and I/O deadlines belong to the caller's factory or adapter. In DI applications, assemble pools in the owning driver or application provider and inject the resulting typed services into consumers.
+The package needs the Swoole extension `>=6.2.3 <6.3`; the thread backend also needs a ZTS PHP and a Swoole build with thread support. It has no other dependency and works without the container or a build: the caller supplies the connection class and assembles the pool.
 
-`ConnectionFactoryInterface::create()` creates a fresh wrapper implementing `connect()`, `isHealthy()`, `reconnect()` and `close()`. Pool calls `connect()` before the first borrow. The adapter owns authentication, health checks, cleanup of partially opened connections, transaction/session reset and reconnection behavior. The current borrower may explicitly `reconnect()` its adapter; Pool does not replay requests or reconnect a borrowed connection. A false health result retires the wrapper and allows replacement through the factory.
+## What it provides
 
-Custom capacity coordinators implement `CapacityInterface::reserve($timeout, $owner)` and `release($reservation, $owner)`. Custom pool implementations provide `maintain()` through `PoolInterface`, which `SwooleTimerScheduler` uses.
+- `Pool`, which lends connections with `acquire()` and takes them back with `release()` or `discard()`.
+- A limit on all connections, whether idle, borrowed, being created, checked, or closed, with a bounded wait.
+- Capacity for the coroutines of one process, for forked processes, or for Swoole threads.
+- Health checks when a connection is borrowed, returned, both, or never.
+- Maintenance that replaces unhealthy connections and refills or shrinks the idle set by demand, by hand or on a Swoole timer.
+- An orderly shutdown that closes idle connections and those returned afterwards.
 
-## Capacity and backend selection
+It does not:
 
-| Backend                      | Shared scope                     | Idle connections                           | Assembly                                                               |
-|------------------------------|----------------------------------|--------------------------------------------|------------------------------------------------------------------------|
-| `Capacity\CoroutineCapacity` | Coroutines in one process/thread | Retained and reused locally                | One exclusive backend per pool; active operations require a coroutine. |
-| `Capacity\ProcessCapacity`   | Related forked processes         | Returned clients are closed by their owner | Create the backend before forking and each Pool/factory after forking. |
-| `Capacity\ThreadCapacity`    | Native Swoole threads            | Returned clients are closed by their owner | Create shared state once and attach it in each thread.                 |
+- provide clients or protocol adapters;
+- reconnect a borrowed connection or repeat a request;
+- reset transactions or sessions before reuse;
+- return a connection automatically or revoke a borrower's reference;
+- move a connection between processes or threads;
+- recover capacity held by a process that died.
 
-`CoroutineCapacity($capacity, $channel)` uses `Channel\SwooleChannel` by default; an alternative initially empty, exclusive `ChannelInterface<bool>` can be passed instead. The channel preserves FIFO payload identity, including null and false for general channel users. Full writes are rejected immediately; zero-timeout reads never wait. Native channel construction is lazy, so constructing or closing an unused coroutine pool does not require a coroutine.
+## Quick start
 
-Process coordination uses Swoole shared memory and thread coordination uses a native thread map; only capacity reservations are shared, while PHP client objects and sockets stay with the pool that created them. Capacity waiters poll with a monotonic deadline and at most a 1 ms pause, yielding cooperatively inside a coroutine and sleeping otherwise. Shared waiters have no FIFO fairness guarantee. A stalled native mutex can delay a waiter beyond its capacity timeout.
-
-Shared backends bound connections during creation, use and cleanup across their participants. They retire returned owner-local clients; they do not transfer persistent idle clients to another process or thread. Supplying the same shared backend intentionally shares its global capacity and shutdown; distinct backends isolate pools. Independent coroutine capacities do not enforce an application-wide limit. Native connection transport and a centralized connection broker are not provided.
-
-`maxConnections()` is a fixed upper bound, not the current number of idle connections. If `M` is that bound and `B` is the borrowed count, the pool's remaining capacity at rest is `P = M - B`. The number of ready idle connections `I` may be smaller than `P`; missing connections are replenished during maintenance.
-
-| Completed transition                                   | Remaining capacity `P` | Ready idle connections `I` |
-|--------------------------------------------------------|------------------------|----------------------------|
-| Borrow a healthy idle connection                       | -1                     | -1                         |
-| Return a reusable connection                           | +1                     | +1                         |
-| Return and successfully destroy an unusable connection | +1                     | Unchanged                  |
-| Destroy an unhealthy idle connection                   | Unchanged              | -1                         |
-| Successfully replenish a connection                    | Unchanged              | +1                         |
-
-Borrowed connections remain registered for counting and return validation, but maintenance never operates on them. Idle, borrowed, creating, checking and closing connections all count towards `M`, including failed cleanup awaiting a retry. `CapacityInterface::available()` reports reservable slots, not `I`; in-flight operations can temporarily occupy slots as well. Only successful creation produces a ready connection.
-
-## Assembly and borrowing
-
-The owning driver or application provider constructs `PoolOption` with its caller-supplied `$factory`:
+Wrap a client in a connection class. This one only counts how many connections were opened. Save it as `src/Pool/CounterConnection.php`:
 
 ```php
+<?php
+
+declare(strict_types=1);
+
+namespace Src\Pool;
+
+use SuperKernel\Pool\Contract\ConnectionInterface;
+
+final class CounterConnection implements ConnectionInterface
+{
+    private static int $opened = 0;
+
+    public ?int $id = null;
+
+    public bool $broken = false;
+
+    public function connect(): void
+    {
+        $this->id = ++self::$opened;
+    }
+
+    public function isHealthy(): bool
+    {
+        return !$this->broken;
+    }
+
+    public function reconnect(): void
+    {
+        $this->close();
+        $this->connect();
+    }
+
+    public function close(): void
+    {
+        $this->id = null;
+    }
+}
+```
+
+The pool creates connections through a factory. Save it as `src/Pool/CounterConnectionFactory.php`:
+
+```php
+<?php
+
+declare(strict_types=1);
+
+namespace Src\Pool;
+
+use SuperKernel\Pool\Contract\ConnectionFactoryInterface;
+
+/**
+ * @implements ConnectionFactoryInterface<CounterConnection>
+ */
+final class CounterConnectionFactory implements ConnectionFactoryInterface
+{
+    public int $created = 0;
+
+    public function create(): CounterConnection
+    {
+        ++$this->created;
+
+        return new CounterConnection();
+    }
+}
+```
+
+Borrow a connection twice inside a coroutine. Save the script as `bin/pool.php`:
+
+```php
+<?php
+
+declare(strict_types=1);
+
+use Src\Pool\CounterConnection;
+use Src\Pool\CounterConnectionFactory;
 use SuperKernel\Pool\Capacity\CoroutineCapacity;
 use SuperKernel\Pool\Config\PoolOption;
 use SuperKernel\Pool\Pool;
 
-$options = new PoolOption(
-    factory: $factory,
-    capacity: new CoroutineCapacity(8),
-    maxConnections: 8,
-    waitTimeout: 0.5,
-);
-$pool = new Pool($options);
+use function Swoole\Coroutine\run;
+
+require dirname(__DIR__) . '/vendor/autoload.php';
+
+run(static function (): void {
+    $pool = new Pool(new PoolOption(
+        factory: new CounterConnectionFactory(),
+        capacity: new CoroutineCapacity(2),
+        maxConnections: 2,
+        waitTimeout: 0.5,
+    ));
+
+    foreach (['first', 'second'] as $borrower) {
+        $connection = $pool->acquire();
+        assert($connection instanceof CounterConnection);
+
+        try {
+            echo "The {$borrower} borrower uses connection {$connection->id}", PHP_EOL;
+        } finally {
+            $pool->release($connection);
+        }
+    }
+
+    $pool->close();
+});
 ```
 
-The factory, capacity coordinator and fixed maximum are required. The wait timeout defaults to `1.0` second, health checks to `HealthCheckMode::OnBorrowAndReturn`, and frequency to a pool-local `ConstantFrequency` instance. Pass explicit `healthChecks` and `frequency` arguments to select other policies. Options retain fixed values and collaborator references; the referenced factory, capacity coordinator and frequency policy keep their own runtime state.
+Run the script:
 
-Pool validates positive matching capacity and a finite non-negative timeout before connection I/O. Constructing options or Pool starts no coroutine, timer, worker or connection. Each consuming component uses `PoolOption` directly; no option interface, subclass or driver-specific option implementation is needed. Driver configuration remains with its connection factory, and the generic package does not discover it.
-
-Inside a consumer and the backend's required runtime:
-
-```php
-$connection = $this->pool->acquire();
-try {
-    // Use the client and restore its transaction/session state before returning it.
-} finally {
-    $this->pool->release($connection);
-}
+```bash
+php bin/pool.php
 ```
 
-Use `discard($connection)` instead of `release($connection)` for a broken or non-resettable connection. Return each acquired object exactly once to the same pool. The pool rejects objects that are not currently borrowed from it, including duplicate returns and connections from another pool. It removes borrowed ownership before running health or cleanup callbacks, so a second return is rejected even while cleanup is still running. Capacity remains reserved through validation and cleanup. Failed cleanup retains its reservation until a later maintenance pass or `close()` succeeds; never return the same object again to retry cleanup.
+It prints:
 
-Callers own the lifetime of their references: stop using a connection and restore its session state before returning it. There is no automatic return or access revocation. After the same object is acquired again, the pool cannot distinguish the former borrower's reference from the current borrower's reference. Prevent such stale use and delayed returns in application code; no per-borrow lease or public receipt is issued.
-
-`acquire(null)` uses the configured timeout; zero attempts immediate acquisition. Only capacity waiting is timed by Pool. Connection I/O has the adapter's own deadlines. Exhaustion raises `PoolTimeoutException`, shutdown raises `PoolClosedException`, and canceled waits or invalid ownership operations raise `PoolException`. Creation, establishment, health checks and cleanup hold capacity reservations. Original acquisition and health exceptions survive additional cleanup errors. Failed cleanup removes the wrapper from borrowing but retains its resource allocation and reservation. Adapters must support repeated `close()` attempts; a failed close must never allow a replacement to exceed the connection limit.
-
-## Process and thread ownership
-
-Every connection is acquired and returned through its owning pool in the same process or thread. Shared backends coordinate capacity and shutdown, not remote returns. Application code only receives connection objects. Returns complete locally without a notification queue or a later maintenance pass when cleanup succeeds. Failed cleanup is retried locally by maintenance or shutdown.
-
-For processes, construct `new ProcessCapacity($limit)` before `Swoole\Process::start()`, and construct a new `Pool` with that inherited backend inside each process. Do not use a Pool or client wrapper inherited from the parent.
-
-For threads, the creator uses `ThreadCapacity::create($limit)` and passes `$backend->state()` and `$backend->mutex()` through `Swoole\Thread` arguments. The receiving thread attaches `new ThreadCapacity($state, $mutex)` and constructs its own factory and Pool. Only the native shared handles cross the boundary.
-
-There is no automatic expiration or crash recovery for reservations. If a resource owner dies, capacity cannot be safely reclaimed by a timeout alone; the application supervisor must retire that backend and establish a new generation after confirming old owners have stopped. The package does not infer process death, replay requests or steal live reservations.
-
-## Health checks and scheduling
-
-`Constants\HealthCheckMode` controls synchronous health checks on retained connections:
-
-| Mode                          | Before idle reuse | Before retaining a returned connection |
-|-------------------------------|-------------------|----------------------------------------|
-| `OnBorrow`                    | Yes               | No                                     |
-| `OnReturn`                    | No                | Yes                                    |
-| `OnBorrowAndReturn` (default) | Yes               | Yes                                    |
-| `Manual`                      | No                | No                                     |
-
-A shared backend always closes returned clients and therefore does not run a health check to retain them. Before idle reuse, borrow checking retires unhealthy candidates and examines the remaining idle snapshot before creating one replacement. Unexpected health errors propagate; creation is not retried indefinitely. All modes allow explicit `maintain($minimumIdle = 0)`. A pass retries inactive failed cleanup, checks idle resources and replenishes the target selected by frequency. It never checks active borrowers, skips overlapping passes and counts in-flight creation and cleanup against capacity. The minimum is a best-effort floor, not a guarantee while connections are borrowed. Shared backends require a zero idle minimum because they do not retain transferable idle clients.
-
-`PoolOption::frequency()` supplies the policy for replenishment and shrinking. The default `Frequency\ConstantFrequency()` reports `1.0` borrow attempts per second with a `1.0` low-frequency threshold, so maintenance replenishes all capacity not occupied by borrowers or pending operations. A rate below the threshold is low; equality is not low frequency. Fixed strategies ignore borrow events, for example `new ConstantFrequency(0.25, 1.0)` always requests shrinking during maintenance.
-
-Use `Frequency\SmartLowFrequency` to adapt to actual demand:
-
-```php
-use SuperKernel\Pool\Frequency\SmartLowFrequency;
-
-$options = new PoolOption(
-    factory: $factory,
-    capacity: new CoroutineCapacity(8),
-    maxConnections: 8,
-    waitTimeout: 0.5,
-    frequency: new SmartLowFrequency(lowFrequencyThreshold: 1.0, windowSeconds: 60.0),
-);
-$pool = new Pool($options);
+```text
+The first borrower uses connection 1
+The second borrower uses connection 1
 ```
 
-`recordBorrow()` counts each valid `acquire()` attempt before waiting for capacity, including attempts that later time out or fail to connect. Invalid arguments, closed-pool calls and foreign execution contexts do not count. Each event adds `1 / windowSeconds` to the estimated attempts per second. Between events, the estimate decays by `exp(-elapsedSeconds / windowSeconds)`, using monotonic time and constant storage. `frequency()` also applies decay, so activity falls without new borrows. Rates saturate at `PHP_FLOAT_MAX` instead of becoming infinite. The strategy does not report low frequency during its first observation window; after that it compares the decayed estimate with the configured threshold. This is a smoothed demand estimate, not an exact sliding-window count.
+## Public surface
 
-Open pools that retain idle connections evaluate the strategy once at the beginning of each maintenance pass. In low-frequency mode they retire idle connections above `minimumIdle`; with zero minimum they retire all idle connections. Maintenance checks retained connections and replenishes that minimum. At normal frequency it fills unoccupied capacity, even when `minimumIdle` is zero. Neither target can displace borrowed connections or pending operations. Returns restore their slots without creating replacements inline; a maintenance pass performs replenishment. Cleanup failures retain their slots, remaining resources are attempted, and the first error propagates. Each later pass retries a pending close once; it never overlaps a close already in progress. Failed creation leaves a real deficit for the next pass. Successful retry frees capacity before replenishment resumes. Closed pools and shared backends skip frequency evaluation. Returning a connection never evaluates this policy.
+| Name | Kind | Purpose |
+| --- | --- | --- |
+| `SuperKernel\Pool\Contract\ConnectionInterface` | Interface | Implemented by the caller's connection: `connect()`, `isHealthy()`, `reconnect()`, `close()`. |
+| `SuperKernel\Pool\Contract\ConnectionFactoryInterface` | Interface | Implemented by the caller's factory: `create()` returns a new connection. |
+| `SuperKernel\Pool\Config\PoolOption` | Class | The pool's factory, capacity, limit, wait timeout, health checks, and frequency policy. |
+| `SuperKernel\Pool\Pool` | Class | Lends, takes back, maintains, and closes connections. |
+| `SuperKernel\Pool\Contract\PoolInterface` | Interface | The pool's operations, for code that receives a pool. |
+| `SuperKernel\Pool\Capacity\CoroutineCapacity` | Class | Capacity for the coroutines of one process or thread. |
+| `SuperKernel\Pool\Capacity\ProcessCapacity` | Class | Capacity shared by forked processes. |
+| `SuperKernel\Pool\Capacity\ThreadCapacity` | Class | Capacity shared by Swoole threads. |
+| `SuperKernel\Pool\Contract\CapacityInterface` | Interface | Implemented by a custom capacity. |
+| `SuperKernel\Pool\Constants\HealthCheckMode` | Enum | `OnBorrow`, `OnReturn`, `OnBorrowAndReturn`, or `Manual`. |
+| `SuperKernel\Pool\Frequency\ConstantFrequency` | Class | A fixed demand rate for maintenance. |
+| `SuperKernel\Pool\Frequency\SmartLowFrequency` | Class | A demand rate measured from borrow attempts. |
+| `SuperKernel\Pool\Contract\FrequencyInterface` | Interface | Implemented by a custom demand policy. |
+| `SuperKernel\Pool\Maintenance\SwooleTimerScheduler` | Class | Runs maintenance on a Swoole timer. |
+| `SuperKernel\Pool\Contract\MaintenanceSchedulerInterface` | Interface | Starts and stops a maintenance trigger. |
+| `SuperKernel\Pool\Channel\SwooleChannel` | Class | A bounded first-in, first-out coroutine channel. |
+| `SuperKernel\Pool\Contract\ChannelInterface` | Interface | Implemented by a custom channel. |
 
-Frequency strategies start no timer and perform no connection I/O. Give each pool its own mutable strategy; constant strategies can be shared. Custom strategies must not yield or perform I/O. `SmartLowFrequency` optionally accepts a non-yielding `Closure(): float` clock returning finite monotonic seconds, allowing deterministic tests; the default uses `hrtime()`. A failing, non-finite or regressing clock propagates an error without silently changing the estimate.
+## Behavior to know
 
-Call `maintain()` manually, from an application event or task, or from any external scheduler. For a Swoole timer, explicitly create and start the supplied adapter:
+- A pool with `CoroutineCapacity` works only inside a coroutine; outside one, `acquire()` raises `SuperKernel\Pool\Exception\PoolException` with `Connection pool operations require an active Swoole coroutine.` Creating or closing an unused pool needs no coroutine.
+- `acquire()` waits up to the timeout, `1.0` second by default and `0` for no wait, then raises `SuperKernel\Pool\Exception\PoolTimeoutException`. Only the wait for capacity is timed; the connection's own I/O keeps its own deadlines.
+- Return every connection exactly once to the pool that lent it; a second return or a foreign connection raises `The connection is not currently borrowed from this pool.`
+- A pool belongs to the process or thread that created it; using it from another raises `Create each resource-owning pool in its own process or thread.`
+- After `close()`, `acquire()` raises `SuperKernel\Pool\Exception\PoolClosedException`, and borrowed connections are closed when they are returned.
+- `maxConnections` must equal the capacity's limit, and the timeout must be finite and not negative; otherwise the pool raises `Positive matching capacity and a finite timeout are required.`
 
-```php
-use SuperKernel\Pool\Maintenance\SwooleTimerScheduler;
+## Documentation
 
-$scheduler = new SwooleTimerScheduler(
-    $pool,
-    intervalMilliseconds: 1000,
-    onError: static function (\Throwable $error) use ($logger): void {
-        $logger->error($error->getMessage());
-    },
-    minimumIdle: 2,
-);
-$scheduler->start();
-```
+The developer documentation covers connections and factories, borrowing and returning, capacity in coroutines, processes, and threads, health checks, maintenance and demand, shutdown, the error messages, and what not to do: [SuperKernel Pool](https://github.com/super-kernel/.github/blob/main/docs/components/pool.md).
 
-Use `minimumIdle: 0` for process and thread backends. They do not retain idle connections or need maintenance to finish returns. The timer creates a coroutine when needed, skips overlapping passes and reports failures to the required error callback; that callback must not throw. `stop()` cancels future passes and lets an active pass finish. A closed pool stops the timer on the next tick; retry shutdown cleanup with explicit `close()` calls if needed. Scheduling and connection I/O never start in constructors.
+## License
 
-## Shutdown
-
-`close()` permanently closes the backend and rejects capacity waiters. It attempts every local idle cleanup and then propagates the first error. Active borrowers close when returned; in-flight creation or health checks cannot hand out connections after shutdown. Each caller must still return its borrowed objects to their owning pool; cleanup happens during that return. Repeated `close()` calls retry failed cleanup and leave successfully closed resources untouched. There is no asynchronous destructor cleanup. Close coroutine pools inside their runtime and stop scheduling as part of the owner's lifecycle.
+Released under the MIT License. See [LICENSE](LICENSE).
