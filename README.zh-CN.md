@@ -143,9 +143,10 @@ run(static function (): void {
 });
 ```
 
-运行脚本：
+构建项目并运行脚本：
 
 ```bash
+skernel build
 php bin/pool.php
 ```
 

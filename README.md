@@ -143,9 +143,10 @@ run(static function (): void {
 });
 ```
 
-Run the script:
+Build the project and run the script:
 
 ```bash
+skernel build
 php bin/pool.php
 ```
 
